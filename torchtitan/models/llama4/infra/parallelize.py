@@ -548,6 +548,34 @@ def apply_moe_ep_tp(
         )
 
 
+def _has_float8_quantized_experts(moe: nn.Module) -> bool:
+    """
+    Check if MoE experts have been quantized with float8.
+
+    When Float8GroupedMMConverter is applied, expert parameters are wrapped
+    with ScaledGroupedMMTensor from torchao. This causes incompatibility with
+    torch.compile(fullgraph=True) when used inside CheckpointWrapper because
+    the float8 operations use @torch._dynamo.disable internally.
+    """
+    if not hasattr(moe, "experts"):
+        return False
+
+    experts = moe.experts
+    # Check if any of the expert parameters have been quantized
+    # by looking for torchao's quantized tensor types
+    for param in experts.parameters():
+        param_type = type(param).__name__
+        # ScaledGroupedMMTensor is the wrapper type used by torchao's MoETrainingConfig
+        if "ScaledGroupedMMTensor" in param_type or "Float8" in param_type:
+            return True
+        # Also check the underlying data if it's wrapped
+        if hasattr(param, "_data"):
+            data_type = type(param._data).__name__
+            if "ScaledGroupedMMTensor" in data_type or "Float8" in data_type:
+                return True
+    return False
+
+
 def apply_compile(model: nn.Module, compile_config: CompileConfig, ep_enabled: bool):
     """
     Apply torch.compile to each TransformerBlock, which makes compilation efficient due to
@@ -567,7 +595,8 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig, ep_enabled: b
             # prevent AC from falling back the whole graph to eager.
             # TODO: Fix Compile(AC(graph break))
 
-            if isinstance(transformer_block, CheckpointWrapper):
+            is_checkpointed = isinstance(transformer_block, CheckpointWrapper)
+            if is_checkpointed:
                 # TODO: Make CheckpointWrapper a transparent wrapper
                 # unwrap so that .named_children() works
                 block = transformer_block._checkpoint_wrapped_module
@@ -583,6 +612,21 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig, ep_enabled: b
                     # avoid graph breaking on the GroupedExperts' FSDP hooks
                     # by wrapping each submod's forward instead of their __call__
                     moe = submod
+
+                    # When MoE is inside a CheckpointWrapper and experts have float8
+                    # quantization, we cannot compile MoE submodules with fullgraph=True.
+                    # The float8 ops use @torch._dynamo.disable which is incompatible
+                    # with checkpoint's higher-order operator tracing.
+                    # In this case, we use fullgraph=False to allow graph breaks.
+                    use_fullgraph = not (
+                        is_checkpointed and _has_float8_quantized_experts(moe)
+                    )
+                    if not use_fullgraph:
+                        logger.info(
+                            f"Using fullgraph=False for MoE submodules in layer {layer_id} "
+                            "due to float8 quantization + activation checkpointing."
+                        )
+
                     for attr_name, submod in moe.named_children():
                         if attr_name == "experts":
                             # NOTE: We don't compile token dispatch and token combine due to an issue on B200:
@@ -592,7 +636,9 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig, ep_enabled: b
                             moe,
                             attr_name,
                             torch.compile(
-                                submod, backend=compile_config.backend, fullgraph=True
+                                submod,
+                                backend=compile_config.backend,
+                                fullgraph=use_fullgraph,
                             ),
                         )
                 else:
