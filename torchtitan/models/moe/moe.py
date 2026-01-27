@@ -116,15 +116,34 @@ def _run_experts_grouped_mm(
 ) -> torch.Tensor:
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
 
-    h = F.silu(
-        torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)
-    )
-    h = h * torch._grouped_mm(
-        x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets
-    )
-    out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
+    # Check if weights are tensor subclasses (e.g., ScaledGroupedMMTensor for float8/mxfp8).
+    # If so, skip explicit weight dtype casts to allow the subclass to handle quantization
+    # via __torch_dispatch__. Casting to bfloat16 would strip the subclass and lose
+    # quantization metadata, causing NaN gradients due to forward/backward mismatch.
+    if type(w1) is not torch.Tensor:
+        # Quantized path: let the tensor subclass handle weight quantization
+        # Cast activations to bf16 for grouped_mm compatibility
+        x_bf16 = x.bfloat16()
+        # Compute gate and up projections separately to avoid numerical issues
+        # when the element-wise product creates extreme values for float8 quantization
+        gate = torch._grouped_mm(x_bf16, w1.transpose(-2, -1), offs=offsets)
+        up = torch._grouped_mm(x_bf16, w3.transpose(-2, -1), offs=offsets)
+        # Apply SiLU activation: silu(gate) * up
+        # Use float32 for the intermediate computation to maintain numerical stability
+        # before passing to the final float8 quantized grouped_mm
+        h = (F.silu(gate.float()) * up.float()).bfloat16()
+        out = torch._grouped_mm(h, w2.transpose(-2, -1), offs=offsets)
+    else:
+        # Non-quantized path: explicit bf16 conversion for torch._grouped_mm
+        h = F.silu(
+            torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)
+        )
+        h = h * torch._grouped_mm(
+            x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets
+        )
+        out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets)
 
-    return out
+    return out.type_as(x)
 
 
 class GroupedExperts(nn.Module):
