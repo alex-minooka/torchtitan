@@ -587,6 +587,10 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig, ep_enabled: b
     # Workaround for https://github.com/pytorch/pytorch/issues/166926
     # pyrefly: ignore [missing-attribute]
     torch._C._dynamo.eval_frame._set_lru_cache(False)
+
+    # Track if any layer has float8-quantized experts
+    any_layer_has_float8_experts = False
+
     # pyrefly: ignore [missing-attribute]
     for layer_id, transformer_block in model.layers.named_children():
         if transformer_block.moe_enabled:
@@ -618,9 +622,11 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig, ep_enabled: b
                     # The float8 ops use @torch._dynamo.disable which is incompatible
                     # with checkpoint's higher-order operator tracing.
                     # In this case, we use fullgraph=False to allow graph breaks.
-                    use_fullgraph = not (
-                        is_checkpointed and _has_float8_quantized_experts(moe)
-                    )
+                    has_float8_experts = _has_float8_quantized_experts(moe)
+                    if has_float8_experts:
+                        any_layer_has_float8_experts = True
+
+                    use_fullgraph = not (is_checkpointed and has_float8_experts)
                     if not use_fullgraph:
                         logger.info(
                             f"Using fullgraph=False for MoE submodules in layer {layer_id} "
@@ -668,13 +674,23 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig, ep_enabled: b
         in moe_module._run_experts_grouped_mm.__qualname__
     )
     if not already_patched:
-        moe_module._run_experts_grouped_mm = torch.compile(
-            moe_module._run_experts_grouped_mm,
-            backend=compile_config.backend,
-            fullgraph=True,
-        )
+        # When float8 is enabled for experts, torchao's ScaledGroupedMMTensor intercepts
+        # _grouped_mm calls. We skip compiling _run_experts_grouped_mm in this case to
+        # avoid interference between torch.compile and float8's dynamic scaling.
+        # The float8 implementation handles optimization internally.
+        if any_layer_has_float8_experts:
+            logger.info(
+                "Skipping torch.compile for _run_experts_grouped_mm "
+                "due to float8 quantization for experts."
+            )
+        else:
+            moe_module._run_experts_grouped_mm = torch.compile(
+                moe_module._run_experts_grouped_mm,
+                backend=compile_config.backend,
+                fullgraph=True,
+            )
 
-        if ep_enabled:
+        if ep_enabled and not any_layer_has_float8_experts:
             compiled_fn = moe_module._run_experts_grouped_mm
 
             # keep function logic in sync with `already_patched` above
