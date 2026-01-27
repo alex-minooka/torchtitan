@@ -27,7 +27,7 @@ set -ex
 
 NGPU=${NGPU:-"8"}
 export LOG_RANK=${LOG_RANK:-0}
-CONFIG_FILE=${CONFIG_FILE:-"./torchtitan/models/llama3/train_configs/debug_model.toml"}
+CONFIG_FILE=${CONFIG_FILE:-"./torchtitan/models/deepseek_v3/train_configs/deepseek_v3_16b.toml"}
 TRAIN_FILE=${TRAIN_FILE:-"torchtitan.train"}
 COMM_MODE=${COMM_MODE:-""}
 

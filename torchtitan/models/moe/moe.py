@@ -115,14 +115,24 @@ def _run_experts_grouped_mm(
     num_tokens_per_expert: torch.Tensor,
 ) -> torch.Tensor:
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+    
+    if type(w1) is not torch.Tensor:
+        h = F.silu(
+            torch._grouped_mm(x.bfloat16(), w1.transpose(-2, -1), offs=offsets)
+        )
+        h = h * torch._grouped_mm(
+            x.bfloat16(), w3.transpose(-2, -1), offs=offsets
+        )
+        out = torch._grouped_mm(h, w2.transpose(-2, -1), offs=offsets).type_as(x)
 
-    h = F.silu(
-        torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)
-    )
-    h = h * torch._grouped_mm(
-        x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets
-    )
-    out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
+    else:
+        h = F.silu(
+            torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)
+        )
+        h = h * torch._grouped_mm(
+            x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets
+        )
+        out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
 
     return out
 
