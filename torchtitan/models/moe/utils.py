@@ -8,8 +8,6 @@ from typing import Callable, Literal
 
 import torch
 
-from torchtitan.tools.utils import _round_up
-
 from .kernels import generate_permute_indices
 
 TOKEN_GROUP_ALIGN_SIZE_M = 8
@@ -41,8 +39,21 @@ def set_token_group_alignment_size_m(
 
 def _permute(x, num_tokens_per_expert, ep_degree, num_local_experts):
     global TOKEN_GROUP_ALIGN_SIZE_M
-    x_padded_per_expert = x.shape[0] + num_local_experts * TOKEN_GROUP_ALIGN_SIZE_M
-    padded_max_len = _round_up(x_padded_per_expert, TOKEN_GROUP_ALIGN_SIZE_M)
+
+    # Compute padded_max_len consistently with how generate_permute_indices
+    # computes m_offsets[-1] to avoid size mismatch between x and offsets.
+    # This must match the logic in kernels.py lines 181-193.
+    total_tokens_per_expert = num_tokens_per_expert.view(ep_degree, -1).sum(0)
+    total_tokens_per_expert = torch.clamp_min(
+        total_tokens_per_expert, TOKEN_GROUP_ALIGN_SIZE_M
+    )
+    aligned_sizes = (
+        (total_tokens_per_expert + TOKEN_GROUP_ALIGN_SIZE_M - 1)
+        // TOKEN_GROUP_ALIGN_SIZE_M
+        * TOKEN_GROUP_ALIGN_SIZE_M
+    )
+    padded_max_len = aligned_sizes.sum().item()
+
     with torch.no_grad():
         (permuted_indices, num_tokens_per_expert, _offsets,) = generate_permute_indices(
             num_tokens_per_expert,
