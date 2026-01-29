@@ -200,6 +200,16 @@ class Float8GroupedMMConverter(QuantizationConverter):
         # For fp8 grouped GEMM, token group sizes must be multiples of 16
         # (16 byte alignment / 1 byte per elem = 16 elements)
         set_token_group_alignment_size_m(FP8_GROUP_ALIGNMENT_SIZE)
+
+        # Float8 grouped GEMM uses rowwise dynamic quantization, which requires
+        # this workaround for https://github.com/pytorch/pytorch/issues/150859
+        # when torch.compile is enabled on the model
+        if model_compile_enabled:
+            torch._inductor.config.emulate_precision_casts = True
+            logger.debug(
+                "Set torch._inductor.config.emulate_precision_casts to True for float8 grouped GEMM"
+            )
+
         self.enabled = True
 
     def convert(self, model: nn.Module):
