@@ -63,7 +63,12 @@ def _permute(x, num_tokens_per_expert, ep_degree, num_local_experts):
             TOKEN_GROUP_ALIGN_SIZE_M,
         )
 
-    x = torch.vstack((x, x.new_zeros((x.shape[-1]))))
+    # Use small non-zero values for padding instead of zeros.
+    # With float8 rowwise quantization, zero rows produce scale=0,
+    # which causes NaN in backward pass (division by zero).
+    # Small non-zero values ensure valid scales while having negligible
+    # impact on computation (padding outputs are discarded in _unpermute).
+    x = torch.vstack((x, x.new_full((1, x.shape[-1]), fill_value=1e-6)))
     input_shape = x.shape
     x = x[permuted_indices, :]
 
