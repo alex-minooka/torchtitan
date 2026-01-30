@@ -132,8 +132,10 @@ def _run_experts_for_loop(
     out = torch.cat(out_experts_splits, dim=0)
 
     # side-effect code due to the usage of generate_permute_indices
+    # Use small non-zero values for padding to avoid potential numerical issues
+    # with float8 quantization in backward pass
     # pyrefly: ignore [no-matching-overload]
-    out = torch.vstack((out, out.new_zeros((num_padding, out.shape[-1]))))
+    out = torch.vstack((out, out.new_full((num_padding, out.shape[-1]), 1e-6)))
 
     return out
 
@@ -158,7 +160,8 @@ def _run_experts_grouped_mm(
     b1 = mlp1_bias.repeat_interleave(num_tokens_per_expert_long, dim=0)
     tail_slack = x.shape[0] - int(offsets[-1])
     if tail_slack:
-        b1 = torch.cat([b1, b1.new_zeros((tail_slack, b1.shape[-1]))], dim=0)
+        # Use small non-zero values for padding to avoid numerical issues with float8
+        b1 = torch.cat([b1, b1.new_full((tail_slack, b1.shape[-1]), 1e-6)], dim=0)
     h = h + b1.to(h.dtype)
 
     h = swiglu(h, limit=swiglu_limit)
@@ -168,8 +171,8 @@ def _run_experts_grouped_mm(
     b2_base = mlp2_bias.repeat_interleave(num_tokens_per_expert_long, dim=0)
     b2 = ScaleBiasForward.apply(b2_base, tp_degree)
     tail_slack = x.shape[0] - int(offsets[-1])
-    if tail_slack:  # padding
-        b2 = torch.cat([b2, b2.new_zeros((tail_slack, b2.shape[-1]))], dim=0)
+    if tail_slack:  # padding - use small non-zero values
+        b2 = torch.cat([b2, b2.new_full((tail_slack, b2.shape[-1]), 1e-6)], dim=0)
     h = h + b2.to(h.dtype)
 
     return h

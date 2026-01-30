@@ -33,6 +33,7 @@ class MoEArgs:
     num_limited_groups: int | None = None
     use_grouped_mm: bool = True  # grouped mm or for-loop for the experts computation
     load_balance_coeff: float | None = 1e-3
+    max_expert_bias: float | None = 10.0  # max absolute value for expert_bias to prevent NaN
 
     _debug_force_load_balance: bool = False
     # if True, we force each experts get same amount of token via round-robin
@@ -102,7 +103,9 @@ def _run_experts_for_loop(
     out = torch.cat(out_experts_splits, dim=0)
 
     # side-effect code due to the usage of generate_permute_indices
-    out = torch.vstack((out, out.new_zeros((num_padding, out.shape[-1]))))
+    # Use small non-zero values for padding to avoid potential numerical issues
+    # with float8 quantization in backward pass
+    out = torch.vstack((out, out.new_full((num_padding, out.shape[-1]), 1e-6)))
 
     return out
 
@@ -309,18 +312,6 @@ class TokenChoiceTopKRouter(nn.Module):
         # scores shape (bs*slen, num_experts)
         scores = self.gate(x)
 
-        # Check for NaN BEFORE sigmoid/softmax
-        if scores.isnan().any():
-            nan_count = scores.isnan().sum().item()
-            total = scores.numel()
-            print(f"CRITICAL: {nan_count}/{total} NaN values in gate output!")
-            
-            # Which tokens have NaN?
-            nan_tokens = scores.isnan().any(dim=1)
-            print(f"Tokens with NaN scores: {nan_tokens.sum().item()}")
-
-
-
         if self.force_uniform_routing:
             batch_size = x.shape[0]
             # Create round-robin expert assignments for uniform distribution [0, 1, 2, ..., num_experts-1]
@@ -349,25 +340,14 @@ class TokenChoiceTopKRouter(nn.Module):
         else:
             raise NotImplementedError(f"Unknown score function {self.score_func}")
 
-        # Check AFTER sigmoid
-        if scores.isnan().any():
-            print(f"CRITICAL: NaN after sigmoid!")
-
         scores_for_choice = scores if expert_bias is None else scores + expert_bias
-        print(scores_for_choice)
-        print(expert_bias)
-        
+
         # Apply node-limited routing if configured
         if self.num_expert_groups is not None:
             scores_for_choice = self._get_node_limited_routing_scores(scores_for_choice)
         _, selected_experts_indices = torch.topk(
             scores_for_choice, k=self.top_k, dim=-1, sorted=False
         )
-
-        for exp_id in range(self.num_experts):
-            count = (selected_experts_indices == exp_id).sum().item()
-            if count == 0:
-                print(f"WARNING: Expert {exp_id} selected by 0 tokens!")
 
         # top scores shape (bs*slen, top_k)
         # NOTE: The expert_bias is only used for routing. The gating value
@@ -495,6 +475,7 @@ class MoE(nn.Module):
         #       expert_bias is updated outside the model in an optimizer step pre hook
         #       to work with gradient accumulation.
         self.load_balance_coeff = moe_args.load_balance_coeff
+        self.max_expert_bias = moe_args.max_expert_bias
         if self.load_balance_coeff is not None:
             assert self.load_balance_coeff > 0.0
             self.register_buffer(

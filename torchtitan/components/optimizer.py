@@ -427,6 +427,14 @@ def build_optimizers_with_moe_load_balancing(
                     )
                     expert_bias_delta = expert_bias_delta - expert_bias_delta.mean()
                     moe.expert_bias.add_(expert_bias_delta)
+
+                    # Clamp expert_bias to prevent unbounded growth which can cause NaN
+                    # when using quantized (float8) expert computations
+                    if moe.max_expert_bias is not None:
+                        moe.expert_bias.clamp_(
+                            min=-moe.max_expert_bias, max=moe.max_expert_bias
+                        )
+
                     moe.tokens_per_expert.zero_()
 
     if _should_register_moe_balancing_hook(model_parts):

@@ -44,10 +44,10 @@ def _permute(x, num_tokens_per_expert, ep_degree, num_local_experts):
 
     x_padded_per_expert = x.shape[0] + num_local_experts * TOKEN_GROUP_ALIGN_SIZE_M
     padded_max_len = _round_up(x_padded_per_expert, TOKEN_GROUP_ALIGN_SIZE_M)
-    
+
     # total_tokens_per_expert = num_tokens_per_expert.view(ep_degree, -1).sum(0)
     # total_tokens_per_expert = torch.clamp_min(total_tokens_per_expert, TOKEN_GROUP_ALIGN_SIZE_M)
-    # aligned_sizes = ((total_tokens_per_expert + TOKEN_GROUP_ALIGN_SIZE_M - 1) 
+    # aligned_sizes = ((total_tokens_per_expert + TOKEN_GROUP_ALIGN_SIZE_M - 1)
     #                  // TOKEN_GROUP_ALIGN_SIZE_M * TOKEN_GROUP_ALIGN_SIZE_M)
     # padded_max_len = aligned_sizes.sum().int().item()
 
@@ -60,7 +60,12 @@ def _permute(x, num_tokens_per_expert, ep_degree, num_local_experts):
             TOKEN_GROUP_ALIGN_SIZE_M,
         )
 
-    x = torch.vstack((x, x.new_zeros((x.shape[-1]))))
+    # Use small non-zero values for padding instead of zeros.
+    # This prevents NaN in float8 quantization when computing row-wise scales
+    # for experts that receive 0 tokens (their padding tokens would all be zeros,
+    # causing division by zero or inf in scale computation).
+    padding_row = x.new_full((x.shape[-1],), 1e-6)
+    x = torch.vstack((x, padding_row))
     input_shape = x.shape
     x = x[permuted_indices, :]
 
