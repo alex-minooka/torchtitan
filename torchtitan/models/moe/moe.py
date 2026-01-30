@@ -115,24 +115,11 @@ def _run_experts_grouped_mm(
     num_tokens_per_expert: torch.Tensor,
 ) -> torch.Tensor:
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
-    
-    if type(w1) is not torch.Tensor:
-        h = F.silu(
-            torch._grouped_mm(x.bfloat16(), w1.transpose(-2, -1), offs=offsets)
-        )
-        h = h * torch._grouped_mm(
-            x.bfloat16(), w3.transpose(-2, -1), offs=offsets
-        )
-        out = torch._grouped_mm(h, w2.transpose(-2, -1), offs=offsets).type_as(x)
-
-    else:
-        h = F.silu(
-            torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)
-        )
-        h = h * torch._grouped_mm(
-            x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets
-        )
-        out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
+    h1 = torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)    
+    h = F.silu(h1)    
+    h3 = torch._grouped_mm(x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets)    
+    h = h * h3    
+    out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
 
     return out
 
@@ -224,6 +211,8 @@ class TokenChoiceTopKRouter(nn.Module):
         route_norm: bool,
         route_scale: float,
         _debug_force_load_balance: bool = False,
+        force_uniform_routing:bool = False,
+        
     ):
         super().__init__()
         self.gate = nn.Linear(dim, num_experts, bias=False)
@@ -235,6 +224,10 @@ class TokenChoiceTopKRouter(nn.Module):
         self.route_norm = route_norm
         self.route_scale = route_scale
         self._debug_force_load_balance = _debug_force_load_balance
+        self.force_uniform_routing = force_uniform_routing
+
+        if self.force_uniform_routing:
+            self.register_buffer("routing_counter", torch.tensor(0, dtype=torch.long))
 
     def _debug_force_load_balance_routing(
         self, scores: torch.Tensor
@@ -316,6 +309,38 @@ class TokenChoiceTopKRouter(nn.Module):
         # scores shape (bs*slen, num_experts)
         scores = self.gate(x)
 
+        # Check for NaN BEFORE sigmoid/softmax
+        if scores.isnan().any():
+            nan_count = scores.isnan().sum().item()
+            total = scores.numel()
+            print(f"CRITICAL: {nan_count}/{total} NaN values in gate output!")
+            
+            # Which tokens have NaN?
+            nan_tokens = scores.isnan().any(dim=1)
+            print(f"Tokens with NaN scores: {nan_tokens.sum().item()}")
+
+
+
+        if self.force_uniform_routing:
+            batch_size = x.shape[0]
+            # Create round-robin expert assignments for uniform distribution [0, 1, 2, ..., num_experts-1]
+            expert_indices = (self.routing_counter + torch.arange(batch_size * self.top_k, device=x.device)) % self.num_experts
+            self.routing_counter += batch_size
+           
+            # Create one-hot scores for selected experts
+            selected_experts_indices = expert_indices.view(batch_size, self.top_k)
+            top_scores = torch.ones(batch_size, self.top_k, device=x.device, dtype=scores.dtype)
+           
+            # Count tokens per expert
+            num_tokens_per_expert = torch.histc(
+                selected_experts_indices.view(-1).float(),
+                bins=self.num_experts,
+                min=0,
+                max=self.num_experts - 1,
+            )
+           
+            return top_scores, selected_experts_indices, num_tokens_per_expert
+
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
         if self.score_func == "sigmoid":
             scores = torch.sigmoid(scores.to(torch.float32))
@@ -324,13 +349,25 @@ class TokenChoiceTopKRouter(nn.Module):
         else:
             raise NotImplementedError(f"Unknown score function {self.score_func}")
 
+        # Check AFTER sigmoid
+        if scores.isnan().any():
+            print(f"CRITICAL: NaN after sigmoid!")
+
         scores_for_choice = scores if expert_bias is None else scores + expert_bias
+        print(scores_for_choice)
+        print(expert_bias)
+        
         # Apply node-limited routing if configured
         if self.num_expert_groups is not None:
             scores_for_choice = self._get_node_limited_routing_scores(scores_for_choice)
         _, selected_experts_indices = torch.topk(
             scores_for_choice, k=self.top_k, dim=-1, sorted=False
         )
+
+        for exp_id in range(self.num_experts):
+            count = (selected_experts_indices == exp_id).sum().item()
+            if count == 0:
+                print(f"WARNING: Expert {exp_id} selected by 0 tokens!")
 
         # top scores shape (bs*slen, top_k)
         # NOTE: The expert_bias is only used for routing. The gating value
