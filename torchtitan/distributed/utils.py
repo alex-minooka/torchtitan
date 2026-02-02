@@ -539,25 +539,35 @@ def _clip_grad_norm_with_ep(
         rank = dist.get_rank() if dist.is_initialized() else 0
         ep_param_norms = []
         manual_norm_sq_sum = 0.0
+
+        # Helper to get human-readable name for EP param index
+        # Pattern: every 3 params = 1 MoE layer, order is w1, w2, w3
+        def get_ep_param_name(idx):
+            layer_idx = idx // 3
+            weight_names = ["w1 (gate)", "w2 (down)", "w3 (up)"]
+            weight_name = weight_names[idx % 3]
+            return f"MoE layer {layer_idx} {weight_name}"
+
         for i, (p, g) in enumerate(zip(ep_params, ep_grads)):
             g_local = g.to_local()
             param_norm = g_local.norm(norm_type).item()
             manual_norm_sq_sum += param_norm ** norm_type
+            param_name = get_ep_param_name(i)
             # Log ALL EP param norms, not just non-finite ones
             logger.warning(
-                f"[Rank {rank}] EP param [{i}]: shape={tuple(p.shape)}, "
+                f"[Rank {rank}] EP param [{i}] {param_name}: shape={tuple(p.shape)}, "
                 f"norm={param_norm:.6e}, abs_max={g_local.abs().max().item():.6e}"
             )
             if not math.isfinite(param_norm):
-                ep_param_norms.append((i, tuple(p.shape), param_norm, g_local.abs().max().item()))
+                ep_param_norms.append((i, param_name, tuple(p.shape), param_norm, g_local.abs().max().item()))
 
         manual_total_norm = manual_norm_sq_sum ** (1.0 / norm_type)
         logger.warning(f"[Rank {rank}] Manual EP norm computation: {manual_total_norm:.6e}")
 
         if ep_param_norms:
             logger.warning(f"[Rank {rank}] EP params with non-finite norms:")
-            for idx, shape, norm_val, max_val in ep_param_norms:
-                logger.warning(f"  [{idx}] shape={shape}, norm={norm_val}, abs_max={max_val}")
+            for idx, name, shape, norm_val, max_val in ep_param_norms:
+                logger.warning(f"  [{idx}] {name}: shape={shape}, norm={norm_val}, abs_max={max_val}")
 
     # DEBUG: Check DTensor norm before full_tensor() reduction
     ep_grads_total_norm = torch.nn.utils.get_total_norm(
