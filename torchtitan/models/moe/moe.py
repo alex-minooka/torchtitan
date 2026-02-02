@@ -117,16 +117,27 @@ def _run_experts_grouped_mm(
     x: torch.Tensor,
     num_tokens_per_expert: torch.Tensor,
 ) -> torch.Tensor:
+    import torch.distributed as dist
+    rank = dist.get_rank() if dist.is_initialized() else 0
+
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
 
     # DEBUG: Check for NaN/Inf in inputs and zero-token experts
-    _debug_check_grouped_mm_inputs(x, w1, w2, w3, num_tokens_per_expert, offsets)
+    _debug_check_grouped_mm_inputs(x, w1, w2, w3, num_tokens_per_expert, offsets, rank)
 
     h1 = torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)
 
     # DEBUG: Check h1 output
     if h1.isnan().any() or h1.isinf().any():
-        print(f"DEBUG: NaN/Inf in h1 after first grouped_mm: "
+        # Find which expert has NaN
+        for i in range(len(offsets)):
+            start = 0 if i == 0 else offsets[i-1].item()
+            end = offsets[i].item()
+            if end > start:
+                expert_h1 = h1[start:end]
+                if expert_h1.isnan().any():
+                    print(f"[Rank {rank}] Expert {i} has NaN in h1: count={expert_h1.isnan().sum().item()}")
+        print(f"[Rank {rank}] DEBUG: NaN/Inf in h1 after first grouped_mm: "
               f"NaN={h1.isnan().sum().item()}, Inf={h1.isinf().sum().item()}")
 
     h = F.silu(h1)
@@ -134,7 +145,14 @@ def _run_experts_grouped_mm(
 
     # DEBUG: Check h3 output
     if h3.isnan().any() or h3.isinf().any():
-        print(f"DEBUG: NaN/Inf in h3 after second grouped_mm: "
+        for i in range(len(offsets)):
+            start = 0 if i == 0 else offsets[i-1].item()
+            end = offsets[i].item()
+            if end > start:
+                expert_h3 = h3[start:end]
+                if expert_h3.isnan().any():
+                    print(f"[Rank {rank}] Expert {i} has NaN in h3: count={expert_h3.isnan().sum().item()}")
+        print(f"[Rank {rank}] DEBUG: NaN/Inf in h3 after second grouped_mm: "
               f"NaN={h3.isnan().sum().item()}, Inf={h3.isinf().sum().item()}")
 
     h = h * h3
@@ -142,13 +160,20 @@ def _run_experts_grouped_mm(
 
     # DEBUG: Check final output
     if out.isnan().any() or out.isinf().any():
-        print(f"DEBUG: NaN/Inf in final output after third grouped_mm: "
+        for i in range(len(offsets)):
+            start = 0 if i == 0 else offsets[i-1].item()
+            end = offsets[i].item()
+            if end > start:
+                expert_out = out[start:end]
+                if expert_out.isnan().any():
+                    print(f"[Rank {rank}] Expert {i} has NaN in output: count={expert_out.isnan().sum().item()}")
+        print(f"[Rank {rank}] DEBUG: NaN/Inf in final output after third grouped_mm: "
               f"NaN={out.isnan().sum().item()}, Inf={out.isinf().sum().item()}")
 
     return out
 
 
-def _debug_check_grouped_mm_inputs(x, w1, w2, w3, num_tokens_per_expert, offsets):
+def _debug_check_grouped_mm_inputs(x, w1, w2, w3, num_tokens_per_expert, offsets, rank):
     """Debug helper to check for issues in grouped_mm inputs."""
     issues = []
 
@@ -185,7 +210,7 @@ def _debug_check_grouped_mm_inputs(x, w1, w2, w3, num_tokens_per_expert, offsets
         issues.append(f"Input x has large values: max={x_abs_max:.2e}, mean={x_abs_mean:.2e}")
 
     if issues:
-        print(f"DEBUG grouped_mm inputs: {'; '.join(issues)}")
+        print(f"[Rank {rank}] DEBUG grouped_mm inputs: {'; '.join(issues)}")
 
 
 class GroupedExperts(nn.Module):
@@ -450,6 +475,9 @@ class TokenChoiceTopKRouter(nn.Module):
 def _debug_check_router_output(scores, scores_for_choice, expert_bias, top_scores,
                                 selected_experts_indices, num_tokens_per_expert):
     """Debug helper to check router output statistics."""
+    import torch.distributed as dist
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
     issues = []
 
     # Check for NaN/Inf in scores
@@ -485,15 +513,21 @@ def _debug_check_router_output(scores, scores_for_choice, expert_bias, top_score
         expected_per_expert = total_tokens / len(num_tokens_per_expert)
         max_tokens = num_tokens_per_expert.max().item()
         min_tokens = num_tokens_per_expert.min().item()
+        max_expert = num_tokens_per_expert.argmax().item()
+        min_expert = num_tokens_per_expert.argmin().item()
         imbalance_ratio = max_tokens / (min_tokens + 1e-6)
         if imbalance_ratio > 10:
             issues.append(
-                f"High token imbalance: min={min_tokens:.0f}, max={max_tokens:.0f}, "
-                f"expected={expected_per_expert:.1f}, ratio={imbalance_ratio:.1f}x"
+                f"High token imbalance: expert {min_expert} has {min_tokens:.0f}, "
+                f"expert {max_expert} has {max_tokens:.0f}, ratio={imbalance_ratio:.1f}x"
             )
 
+    # Always log token distribution per rank for debugging
+    tokens_list = num_tokens_per_expert.tolist()
+    print(f"[Rank {rank}] Router tokens per expert: {tokens_list}, total={total_tokens:.0f}")
+
     if issues:
-        print(f"DEBUG router: {'; '.join(issues)}")
+        print(f"[Rank {rank}] DEBUG router: {'; '.join(issues)}")
 
 
 # NOTE: the reason we make this a stateless module is to support
