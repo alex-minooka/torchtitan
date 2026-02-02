@@ -118,13 +118,74 @@ def _run_experts_grouped_mm(
     num_tokens_per_expert: torch.Tensor,
 ) -> torch.Tensor:
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
-    h1 = torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)    
-    h = F.silu(h1)    
-    h3 = torch._grouped_mm(x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets)    
-    h = h * h3    
+
+    # DEBUG: Check for NaN/Inf in inputs and zero-token experts
+    _debug_check_grouped_mm_inputs(x, w1, w2, w3, num_tokens_per_expert, offsets)
+
+    h1 = torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)
+
+    # DEBUG: Check h1 output
+    if h1.isnan().any() or h1.isinf().any():
+        print(f"DEBUG: NaN/Inf in h1 after first grouped_mm: "
+              f"NaN={h1.isnan().sum().item()}, Inf={h1.isinf().sum().item()}")
+
+    h = F.silu(h1)
+    h3 = torch._grouped_mm(x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets)
+
+    # DEBUG: Check h3 output
+    if h3.isnan().any() or h3.isinf().any():
+        print(f"DEBUG: NaN/Inf in h3 after second grouped_mm: "
+              f"NaN={h3.isnan().sum().item()}, Inf={h3.isinf().sum().item()}")
+
+    h = h * h3
     out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
 
+    # DEBUG: Check final output
+    if out.isnan().any() or out.isinf().any():
+        print(f"DEBUG: NaN/Inf in final output after third grouped_mm: "
+              f"NaN={out.isnan().sum().item()}, Inf={out.isinf().sum().item()}")
+
     return out
+
+
+def _debug_check_grouped_mm_inputs(x, w1, w2, w3, num_tokens_per_expert, offsets):
+    """Debug helper to check for issues in grouped_mm inputs."""
+    issues = []
+
+    # Check for NaN/Inf in input x
+    if x.isnan().any():
+        issues.append(f"Input x has {x.isnan().sum().item()} NaN values")
+    if x.isinf().any():
+        issues.append(f"Input x has {x.isinf().sum().item()} Inf values")
+
+    # Check for NaN/Inf in weights
+    for name, w in [("w1", w1), ("w2", w2), ("w3", w3)]:
+        # Handle ScaledGroupedMMTensor from torchao
+        w_data = w._data if hasattr(w, "_data") else w
+        if w_data.isnan().any():
+            issues.append(f"Weight {name} has {w_data.isnan().sum().item()} NaN values")
+        if w_data.isinf().any():
+            issues.append(f"Weight {name} has {w_data.isinf().sum().item()} Inf values")
+
+    # Check for zero-token experts
+    zero_token_experts = (num_tokens_per_expert == 0).nonzero(as_tuple=True)[0].tolist()
+    if zero_token_experts:
+        issues.append(f"Experts with 0 tokens: {zero_token_experts}")
+
+    # Check for very small token counts (potential numerical instability)
+    small_token_experts = (num_tokens_per_expert < 16).nonzero(as_tuple=True)[0].tolist()
+    small_counts = num_tokens_per_expert[num_tokens_per_expert < 16].tolist()
+    if small_token_experts:
+        issues.append(f"Experts with <16 tokens: {list(zip(small_token_experts, small_counts))}")
+
+    # Check input magnitude
+    x_abs_max = x.abs().max().item()
+    x_abs_mean = x.abs().mean().item()
+    if x_abs_max > 1e4:
+        issues.append(f"Input x has large values: max={x_abs_max:.2e}, mean={x_abs_mean:.2e}")
+
+    if issues:
+        print(f"DEBUG grouped_mm inputs: {'; '.join(issues)}")
 
 
 class GroupedExperts(nn.Module):
@@ -374,10 +435,65 @@ class TokenChoiceTopKRouter(nn.Module):
             max=self.num_experts,
         )
 
+        # DEBUG: Track router statistics
+        _debug_check_router_output(
+            scores, scores_for_choice, expert_bias, top_scores,
+            selected_experts_indices, num_tokens_per_expert
+        )
+
         return top_scores, selected_experts_indices, num_tokens_per_expert
 
     def init_weights(self, init_std: float):
         nn.init.trunc_normal_(self.gate.weight, mean=0.0, std=init_std)
+
+
+def _debug_check_router_output(scores, scores_for_choice, expert_bias, top_scores,
+                                selected_experts_indices, num_tokens_per_expert):
+    """Debug helper to check router output statistics."""
+    issues = []
+
+    # Check for NaN/Inf in scores
+    if scores.isnan().any():
+        issues.append(f"scores has {scores.isnan().sum().item()} NaN")
+    if scores.isinf().any():
+        issues.append(f"scores has {scores.isinf().sum().item()} Inf")
+
+    # Check for NaN/Inf in scores_for_choice
+    if scores_for_choice.isnan().any():
+        issues.append(f"scores_for_choice has {scores_for_choice.isnan().sum().item()} NaN")
+    if scores_for_choice.isinf().any():
+        issues.append(f"scores_for_choice has {scores_for_choice.isinf().sum().item()} Inf")
+
+    # Check expert_bias
+    if expert_bias is not None:
+        bias_min = expert_bias.min().item()
+        bias_max = expert_bias.max().item()
+        bias_range = bias_max - bias_min
+        if abs(bias_min) > 5 or abs(bias_max) > 5:
+            issues.append(f"expert_bias range: [{bias_min:.2f}, {bias_max:.2f}] (range={bias_range:.2f})")
+        if expert_bias.isnan().any():
+            issues.append(f"expert_bias has NaN!")
+
+    # Check for zero-token experts
+    zero_token_experts = (num_tokens_per_expert == 0).nonzero(as_tuple=True)[0].tolist()
+    if zero_token_experts:
+        issues.append(f"Experts with 0 tokens: {zero_token_experts}")
+
+    # Check for highly imbalanced token distribution
+    total_tokens = num_tokens_per_expert.sum().item()
+    if total_tokens > 0:
+        expected_per_expert = total_tokens / len(num_tokens_per_expert)
+        max_tokens = num_tokens_per_expert.max().item()
+        min_tokens = num_tokens_per_expert.min().item()
+        imbalance_ratio = max_tokens / (min_tokens + 1e-6)
+        if imbalance_ratio > 10:
+            issues.append(
+                f"High token imbalance: min={min_tokens:.0f}, max={max_tokens:.0f}, "
+                f"expected={expected_per_expert:.1f}, ratio={imbalance_ratio:.1f}x"
+            )
+
+    if issues:
+        print(f"DEBUG router: {'; '.join(issues)}")
 
 
 # NOTE: the reason we make this a stateless module is to support

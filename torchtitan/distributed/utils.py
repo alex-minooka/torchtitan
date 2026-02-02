@@ -483,10 +483,31 @@ def _clip_grad_norm_with_ep(
     ep_grads = []
     non_ep_grads = []
 
+    # DEBUG: Track parameters with NaN gradients
+    nan_params_info = []
+
     for p in parameters:
         if p.grad is None:
             continue
         assert isinstance(p, DTensor) and isinstance(p.grad, DTensor)
+
+        # DEBUG: Check for NaN in gradient
+        grad_local = p.grad.to_local()
+        if grad_local.isnan().any():
+            nan_count = grad_local.isnan().sum().item()
+            total_count = grad_local.numel()
+            nan_params_info.append({
+                "shape": tuple(p.shape),
+                "grad_shape": tuple(p.grad.shape),
+                "local_grad_shape": tuple(grad_local.shape),
+                "nan_count": nan_count,
+                "total_count": total_count,
+                "nan_ratio": nan_count / total_count,
+                "mesh_dim_names": p.device_mesh.mesh_dim_names,
+                "grad_max": grad_local[~grad_local.isnan()].abs().max().item() if (~grad_local.isnan()).any() else float('nan'),
+                "grad_min": grad_local[~grad_local.isnan()].abs().min().item() if (~grad_local.isnan()).any() else float('nan'),
+            })
+
         # pyrefly: ignore[not-iterable]
         if "ep" in p.device_mesh.mesh_dim_names:
             ep_params.append(p)
@@ -494,6 +515,18 @@ def _clip_grad_norm_with_ep(
         else:
             non_ep_params.append(p)
             non_ep_grads.append(p.grad)
+
+    # DEBUG: Print NaN info if any found
+    if nan_params_info:
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        logger.warning(f"[Rank {rank}] Found {len(nan_params_info)} parameters with NaN gradients:")
+        for i, info in enumerate(nan_params_info):
+            logger.warning(
+                f"  [{i}] shape={info['shape']}, local_grad_shape={info['local_grad_shape']}, "
+                f"NaN={info['nan_count']}/{info['total_count']} ({info['nan_ratio']:.2%}), "
+                f"mesh={info['mesh_dim_names']}, grad_range=[{info['grad_min']:.2e}, {info['grad_max']:.2e}]"
+            )
+
     ep_grads_total_norm = torch.nn.utils.get_total_norm(
         ep_grads, norm_type, error_if_nonfinite, foreach
     )
@@ -506,6 +539,14 @@ def _clip_grad_norm_with_ep(
     non_ep_grads_total_norm = torch.nn.utils.get_total_norm(
         non_ep_grads, norm_type, error_if_nonfinite, foreach
     ).full_tensor()
+
+    # DEBUG: Log individual norms if total is NaN/Inf
+    if ep_grads_total_norm.isnan() or ep_grads_total_norm.isinf():
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        logger.warning(f"[Rank {rank}] EP grads total norm is {ep_grads_total_norm.item()}")
+    if non_ep_grads_total_norm.isnan() or non_ep_grads_total_norm.isinf():
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        logger.warning(f"[Rank {rank}] Non-EP grads total norm is {non_ep_grads_total_norm.item()}")
 
     if math.isinf(norm_type):
         total_norm = torch.maximum(ep_grads_total_norm, non_ep_grads_total_norm)
