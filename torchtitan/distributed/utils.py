@@ -538,11 +538,22 @@ def _clip_grad_norm_with_ep(
     if ep_grads:
         rank = dist.get_rank() if dist.is_initialized() else 0
         ep_param_norms = []
+        manual_norm_sq_sum = 0.0
         for i, (p, g) in enumerate(zip(ep_params, ep_grads)):
             g_local = g.to_local()
             param_norm = g_local.norm(norm_type).item()
+            manual_norm_sq_sum += param_norm ** norm_type
+            # Log ALL EP param norms, not just non-finite ones
+            logger.warning(
+                f"[Rank {rank}] EP param [{i}]: shape={tuple(p.shape)}, "
+                f"norm={param_norm:.6e}, abs_max={g_local.abs().max().item():.6e}"
+            )
             if not math.isfinite(param_norm):
                 ep_param_norms.append((i, tuple(p.shape), param_norm, g_local.abs().max().item()))
+
+        manual_total_norm = manual_norm_sq_sum ** (1.0 / norm_type)
+        logger.warning(f"[Rank {rank}] Manual EP norm computation: {manual_total_norm:.6e}")
+
         if ep_param_norms:
             logger.warning(f"[Rank {rank}] EP params with non-finite norms:")
             for idx, shape, norm_val, max_val in ep_param_norms:
