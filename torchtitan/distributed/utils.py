@@ -548,13 +548,25 @@ def _clip_grad_norm_with_ep(
             for idx, shape, norm_val, max_val in ep_param_norms:
                 logger.warning(f"  [{idx}] shape={shape}, norm={norm_val}, abs_max={max_val}")
 
+    # DEBUG: Check DTensor norm before full_tensor() reduction
     ep_grads_total_norm = torch.nn.utils.get_total_norm(
         ep_grads, norm_type, error_if_nonfinite, foreach
     )
+
     # ep_grads may be an empty list, in which case get_total_norm returns tensor(0.), a non-DTensor
     # This can occur in PP + EP setups where certain PP ranks only own non-EP layers, for instance.
+    # DEBUG: Check DTensor state before reduction
     if isinstance(ep_grads_total_norm, DTensor):
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        local_tensor = ep_grads_total_norm._local_tensor
+        logger.warning(
+            f"[Rank {rank}] EP norm DTensor before full_tensor(): "
+            f"local_value={local_tensor.item():.6e}, "
+            f"placements={ep_grads_total_norm.placements}, "
+            f"device_mesh={ep_grads_total_norm.device_mesh}"
+        )
         ep_grads_total_norm = ep_grads_total_norm.full_tensor()
+        logger.warning(f"[Rank {rank}] EP norm after full_tensor(): {ep_grads_total_norm.item():.6e}")
 
     # pyrefly: ignore [missing-attribute]
     non_ep_grads_total_norm = torch.nn.utils.get_total_norm(
