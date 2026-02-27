@@ -253,8 +253,8 @@ class Float8GroupedMMConverter(Configurable):
         from torchao.quantization.quant_api import quantize_
 
         try:
-            from torchao.prototype.moe_training.conversion_utils import (
-                MoETrainingConfig,
+            from torchao.prototype.moe_training.config import (
+                FP8GroupedMMConfig,
             )
         except ImportError as e:
             raise ImportError(
@@ -267,7 +267,7 @@ class Float8GroupedMMConverter(Configurable):
                     return True
             return False
 
-        config = MoETrainingConfig()
+        config = FP8GroupedMMConfig()
         quantize_(model, config=config, filter_fn=moe_module_filter_fn)
         logger.info(
             f"Converted MoE layers matching FQNS {self.fqns} "
